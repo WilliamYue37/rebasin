@@ -1,7 +1,7 @@
 import torch.nn as nn
 
 class MLP(nn.Module):
-    def __init__(self, input):
+    def __init__(self, input = 28 * 28):
         super().__init__()
         
         self.input = input
