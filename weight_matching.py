@@ -10,39 +10,93 @@ from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 from plot import plot_interp_acc
 
-def match_weights(a_params, b_params):
+def compute_cost(cost_mat, perm):
+    cost = 0
+    for i in range(len(perm)):
+        cost += cost_mat[i][perm[i]]
+
+    return cost
+
+def init_perms(params): # return identity undo_perms with num_of_layers length and identity perms with total layers length
+    layers = list(params.keys())
+    undo_perms, perms = [], []
+    for i in range(len(layers) // 2):
+        layer_name = layers[2 * i]
+
+        length = params[layer_name].size()[0]
+        perms.append(np.arange(length))
+
+        length = params[layer_name].size()[1]
+        undo_perms.append(np.arange(length))
+        
+    assert len(undo_perms) == len(layers) // 2 and len(perms) == len(layers) // 2
+    return undo_perms, perms
+
+
+def match_weights(a_params, b_params, iterations = 100):
     # find weight matching permutation
-    new_params = copy.deepcopy(b_params)
     layers = list(a_params.keys())
-    n = len(layers)
-    undo_perms = [None] * n
-    for idx in torch.randperm(n // 2 - 1): # only care about weight layers and don't care about last layer
-        layer_name = layers[2 * idx]
-        w_a = a_params[layer_name]
-        w_b = b_params[layer_name]
-        w_a = w_a.reshape((w_a.size(dim = 0), -1))
-        w_b = w_b.reshape((w_b.size(dim = 0), -1))
+    num_of_layers = len(layers) // 2
+    undo_perms, perms = init_perms(a_params)
+    for i in range(iterations):
+        progress = False
+        for idx in torch.randperm(num_of_layers - 1): 
+            # layer L weight (apply layer L undo perm)
+            layer_name = layers[2 * idx]
+            w_a = a_params[layer_name]
+            w_b = b_params[layer_name]
+            w_a = w_a.reshape((w_a.size(dim = 0), -1))
+            w_b = w_b.reshape((w_b.size(dim = 0), -1))
+            w_b = torch.index_select(w_b, 1, torch.from_numpy(undo_perms[idx])) # apply undo perm
 
-        A = w_a @ w_b.T
+            A = w_a @ w_b.T # compute cost matrix
 
-        r_ind, c_ind = linear_sum_assignment(A.detach().numpy(), maximize = True)
+            # layer L bias (no perm)
+            layer_name = layers[2 * idx + 1]
+            w_a = a_params[layer_name]
+            w_b = b_params[layer_name]
+            w_a = w_a.reshape((w_a.size(dim = 0), -1))
+            w_b = w_b.reshape((w_b.size(dim = 0), -1))
+
+            A += w_a @ w_b.T # compute cost matrix
+
+            # layer L + 1 weight (apply layer L + 1 perm)
+            layer_name = layers[2 * (idx + 1)]
+            w_a = a_params[layer_name]
+            w_b = b_params[layer_name]
+            w_a = w_a.reshape((w_a.size(dim = 0), -1))
+            w_b = w_b.reshape((w_b.size(dim = 0), -1))
+            w_b = torch.index_select(w_b, 0, torch.from_numpy(perms[idx + 1])) # apply perm
+
+            A += w_a.T @ w_b # compute cost matrix
             
-        undo_perms[idx] = c_ind
-        new_w_b = torch.index_select(w_b, 0, torch.from_numpy(c_ind))
-        new_params[layer_name] = new_w_b.squeeze()
+            # compare with previous perm
+            r_ind, c_ind = linear_sum_assignment(A.detach().numpy(), maximize = True)
+            assert (torch.tensor(r_ind) == torch.arange(len(r_ind))).all()
+            old_cost = compute_cost(A, perms[idx])
+            new_cost = compute_cost(A, c_ind)
+            progress = progress or new_cost > old_cost + 1e-12
+                
+            perms[idx] = undo_perms[idx + 1] = c_ind
 
-        # update bias layer with same perm
-        bias_layer_name = layers[2 * idx + 1]
-        bias_layer = b_params[bias_layer_name]
-        new_bias_layer = torch.index_select(bias_layer, 0, torch.from_numpy(c_ind))
-        new_params[bias_layer_name] = new_bias_layer.squeeze()
+        if not progress:
+            break
 
-    # apply undo perms
-    for idx in range(1, n // 2):
+    # apply perms
+    new_params = copy.deepcopy(b_params)
+    for idx in range(num_of_layers):
+        # apply perm on weight layer
         layer_name = layers[2 * idx]
-        w_b = new_params[layer_name]
-        new_w_b = torch.index_select(w_b, 1, torch.from_numpy(undo_perms[idx - 1]))
-        new_params[layer_name] = new_w_b.squeeze()
+        w_b = b_params[layer_name]
+        w_b = torch.index_select(w_b, 0, torch.from_numpy(perms[idx])) # rows
+        w_b = torch.index_select(w_b, 1, torch.from_numpy(undo_perms[idx])) # cols
+        new_params[layer_name] = w_b.squeeze()
+
+        # apply perm on bias layer
+        layer_name = layers[2 * idx + 1]
+        w_b = b_params[layer_name]
+        w_b = torch.index_select(w_b, 0, torch.from_numpy(perms[idx])) # rows
+        new_params[layer_name] = w_b.squeeze()
 
     return new_params
     
